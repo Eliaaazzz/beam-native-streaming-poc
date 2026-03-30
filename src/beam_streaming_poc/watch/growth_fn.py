@@ -66,6 +66,8 @@ from beam_streaming_poc.watch.termination import _validate_poll_interval_secs
 
 LOG = logging.getLogger(__name__)
 
+DEFAULT_MAX_COMPLETED_SIZE = 100_000
+
 
 class _SupportsSetWatermark(Protocol):
   def set_watermark(self, watermark: Timestamp) -> None:
@@ -357,7 +359,7 @@ class _WatchGrowthTransform(beam.PTransform):
       poll_interval_secs: float = 1.0,
       termination_condition: Optional[TerminationCondition] = None,
       output_key_fn: Optional[Callable[[Any], Any]] = None,
-      max_completed_size: Optional[int] = None,
+      max_completed_size: Optional[int] = DEFAULT_MAX_COMPLETED_SIZE,
       output_coder: Optional[coders.Coder] = None,
       output_key_coder: Optional[coders.Coder] = None):
     super().__init__()

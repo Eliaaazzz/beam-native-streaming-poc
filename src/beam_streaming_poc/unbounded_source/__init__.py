@@ -25,13 +25,13 @@ from beam_streaming_poc.unbounded_source.restriction import CheckpointMark
 from beam_streaming_poc.unbounded_source.restriction import NOOP_CHECKPOINT_MARK
 from beam_streaming_poc.unbounded_source.restriction import UnboundedReader
 from beam_streaming_poc.unbounded_source.restriction import UnboundedSource
+from beam_streaming_poc.unbounded_source.restriction import ValueWithRecordId
 from beam_streaming_poc.unbounded_source.restriction import _SDFUnboundedSourceRestriction
 from beam_streaming_poc.unbounded_source.restriction import _SDFUnboundedSourceRestrictionCoder
 from beam_streaming_poc.unbounded_source.tracker import _SDFUnboundedSourceRestrictionTracker
-from beam_streaming_poc.unbounded_source.tracker import _SDFUnboundedSourceRestrictionProvider
-from beam_streaming_poc.unbounded_source.tracker import _SDFUnboundedSourceWatermarkEstimatorProvider
 from beam_streaming_poc.unbounded_source.wrapper import ReadFromUnboundedSourceFn
 from beam_streaming_poc.unbounded_source.wrapper import _put_cached_reader
+from beam_streaming_poc.unbounded_source.wrapper import _SDFUnboundedSourceDoFn
 from beam_streaming_poc.unbounded_source.empty_source import EmptyUnboundedSource
 
 __all__ = [
@@ -39,6 +39,7 @@ __all__ = [
     'NOOP_CHECKPOINT_MARK',
     'UnboundedReader',
     'UnboundedSource',
+    'ValueWithRecordId',
     'ReadFromUnboundedSourceFn',
     'EmptyUnboundedSource',
 ]

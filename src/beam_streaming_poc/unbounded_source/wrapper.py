@@ -21,6 +21,11 @@ The DoFn owns the reader lifecycle and drives all I/O (``start`` /
 ``advance`` / ``get_current``).  The tracker is a pure state machine;
 ``try_claim(element)`` is a lightweight declaration that the DoFn is
 about to yield *element*.
+
+The DoFn also implements ``RestrictionProvider`` and
+``WatermarkEstimatorProvider`` directly (following the same pattern as
+``WatchGrowthFn``) so that ``pipeline_options`` is available in
+``split()`` and ``create_reader()``.
 """
 
 import logging
@@ -43,8 +48,10 @@ from apache_beam.utils.timestamp import MIN_TIMESTAMP
 from apache_beam.utils.timestamp import Timestamp
 
 from beam_streaming_poc.unbounded_source.restriction import NOOP_CHECKPOINT_MARK
-from beam_streaming_poc.unbounded_source.tracker import _SDFUnboundedSourceRestrictionProvider
-from beam_streaming_poc.unbounded_source.tracker import _SDFUnboundedSourceWatermarkEstimatorProvider
+from beam_streaming_poc.unbounded_source.restriction import ValueWithRecordId
+from beam_streaming_poc.unbounded_source.restriction import _SDFUnboundedSourceRestriction
+from beam_streaming_poc.unbounded_source.restriction import _SDFUnboundedSourceRestrictionCoder
+from beam_streaming_poc.unbounded_source.tracker import _SDFUnboundedSourceRestrictionTracker
 
 LOG = logging.getLogger(__name__)
 _READER_CACHE_LOCK = threading.Lock()
@@ -113,28 +120,80 @@ def _register_finalizer(bundle_finalizer, checkpoint) -> None:
     bundle_finalizer.register(checkpoint.finalize_checkpoint)
 
 
-class _SDFUnboundedSourceDoFn(core.DoFn):
+class _SDFUnboundedSourceDoFn(
+    core.DoFn, core.RestrictionProvider, core.WatermarkEstimatorProvider):
   """SDF DoFn that reads from an ``UnboundedSource``.
 
   The DoFn owns the reader lifecycle and drives all I/O.  The tracker is
   a pure state machine; ``try_claim(element)`` is a lightweight declaration.
 
   Reader caching mirrors Java's ``cachedReaders`` map in
-  ``UnboundedSourceAsSDFWrapperFn``.
+  ``UnboundedSourceAsSDFWrapperFn`` — but only for the idle/resume path.
+  After a split, the reader is closed and the residual rebuilds from the
+  persisted checkpoint.
+
+  This class also implements ``RestrictionProvider`` and
+  ``WatermarkEstimatorProvider`` so that ``pipeline_options`` is available
+  in ``split()`` and ``create_reader()``.
   """
   POLL_INTERVAL_SECS = 1.0
 
-  def setup(self):
-    self._pipeline_options = None
+  def __init__(self, pipeline_options=None):
+    self._pipeline_options = pipeline_options
+    self._restriction_coder = _SDFUnboundedSourceRestrictionCoder()
+
+  # ---------- RestrictionProvider ----------
+
+  def initial_restriction(self, element):
+    return _SDFUnboundedSourceRestriction(element, checkpoint=None)
+
+  def split(self, element, restriction):
+    if restriction.is_done:
+      return
+
+    checkpoint = restriction.checkpoint
+    if checkpoint is not None and checkpoint is not NOOP_CHECKPOINT_MARK:
+      yield restriction
+      return
+
+    try:
+      sub_sources = restriction.source.split(
+          pipeline_options=self._pipeline_options)
+    except Exception:
+      LOG.warning('Failed to split UnboundedSource; using original restriction.',
+                  exc_info=True)
+      yield restriction
+      return
+
+    for sub_source in sub_sources:
+      yield _SDFUnboundedSourceRestriction(
+          sub_source, checkpoint=None, watermark=restriction.watermark)
+
+  def create_tracker(self, restriction):
+    return _SDFUnboundedSourceRestrictionTracker(restriction)
+
+  def restriction_size(self, element, restriction):
+    return 1.0
+
+  def restriction_coder(self):
+    return self._restriction_coder
+
+  # ---------- WatermarkEstimatorProvider ----------
+
+  def initial_estimator_state(self, element, restriction):
+    return restriction.watermark
+
+  def create_watermark_estimator(self, estimator_state):
+    return ManualWatermarkEstimator(estimator_state)
+
+  # ---------- SDF process ----------
 
   @core.DoFn.unbounded_per_element()
   def process(
       self,
       source,
-      tracker=core.DoFn.RestrictionParam(
-          _SDFUnboundedSourceRestrictionProvider()),
-      watermark_estimator=core.DoFn.WatermarkEstimatorParam(
-          _SDFUnboundedSourceWatermarkEstimatorProvider()),
+      tracker=core.DoFn.RestrictionParam(),
+      watermark_estimator=core.DoFn.WatermarkEstimatorParam(),
       bundle_finalizer=core.DoFn.BundleFinalizerParam()):
     tracker_view = cast(RestrictionTrackerView, tracker)
     wm_estimator = cast(_SupportsSetWatermark, watermark_estimator)
@@ -151,54 +210,83 @@ class _SDFUnboundedSourceDoFn(core.DoFn):
       reader_started = False
       Metrics.counter('UnboundedSourceSDF', 'reader_create_count').inc()
 
-    # ── Read loop ───────────────────────────────────────────────────
-    has_data = reader.start() if not reader_started else reader.advance()
+    dedup = source.requires_deduping()
+    reader_disposed = False
 
-    while True:
-      if has_data:
-        checkpoint = reader.get_checkpoint_mark()
-        wm = _clamp_watermark(reader.get_watermark(), restriction.watermark)
-        restriction.checkpoint = checkpoint
-        restriction.watermark = wm
+    # ── Read loop (exception-safe) ─────────────────────────────────
+    try:
+      has_data = reader.start() if not reader_started else reader.advance()
 
-        if not tracker_view.try_claim(reader.get_current()):
+      while True:
+        if has_data:
+          checkpoint = reader.get_checkpoint_mark()
+          wm = _clamp_watermark(reader.get_watermark(), restriction.watermark)
+          restriction.checkpoint = checkpoint
+          restriction.watermark = wm
+
+          if not tracker_view.try_claim(reader.get_current()):
+            # Split occurred — close reader; residual rebuilds from checkpoint.
+            reader.close()
+            reader_disposed = True
+            _register_finalizer(bundle_finalizer, checkpoint)
+            return
+
+          wm_estimator.set_watermark(wm)
+          value = reader.get_current()
+          if dedup:
+            value = ValueWithRecordId(value, reader.get_current_record_id())
+          yield TimestampedValue(value, reader.get_current_timestamp())
+
+          if wm == MAX_TIMESTAMP:
+            restriction.is_done = True
+            reader.close()
+            reader_disposed = True
+            _register_finalizer(bundle_finalizer, checkpoint)
+            return
+
+          if tracker_view.current_restriction().is_done:
+            # Concurrent split marked restriction done — close reader.
+            reader.close()
+            reader_disposed = True
+            _register_finalizer(bundle_finalizer, checkpoint)
+            return
+
+        else:
+          checkpoint = reader.get_checkpoint_mark()
+          wm = _clamp_watermark(reader.get_watermark(), restriction.watermark)
+          restriction.checkpoint = checkpoint
+          restriction.watermark = wm
+          wm_estimator.set_watermark(wm)
+
+          if wm == MAX_TIMESTAMP:
+            restriction.is_done = True
+            reader.close()
+            reader_disposed = True
+            _register_finalizer(bundle_finalizer, checkpoint)
+            return
+
+          # Idle path — cache reader for same-worker resume.
           _put_cached_reader(source, checkpoint, reader, True)
+          reader_disposed = True
           _register_finalizer(bundle_finalizer, checkpoint)
+          yield ProcessContinuation.resume(self.POLL_INTERVAL_SECS)
           return
 
-        wm_estimator.set_watermark(wm)
-        yield TimestampedValue(reader.get_current(), reader.get_current_timestamp())
+        has_data = reader.advance()
 
-        if wm == MAX_TIMESTAMP:
-          restriction.is_done = True
+    finally:
+      if not reader_disposed:
+        try:
+          checkpoint = reader.get_checkpoint_mark()
+          _register_finalizer(bundle_finalizer, checkpoint)
+        except Exception:
+          LOG.warning('Failed to get checkpoint mark in finally block.',
+                      exc_info=True)
+        try:
           reader.close()
-          _register_finalizer(bundle_finalizer, checkpoint)
-          return
-
-        if tracker_view.current_restriction().is_done:
-          _put_cached_reader(source, checkpoint, reader, True)
-          _register_finalizer(bundle_finalizer, checkpoint)
-          return
-
-      else:
-        checkpoint = reader.get_checkpoint_mark()
-        wm = _clamp_watermark(reader.get_watermark(), restriction.watermark)
-        restriction.checkpoint = checkpoint
-        restriction.watermark = wm
-        wm_estimator.set_watermark(wm)
-
-        if wm == MAX_TIMESTAMP:
-          restriction.is_done = True
-          reader.close()
-          _register_finalizer(bundle_finalizer, checkpoint)
-          return
-
-        _put_cached_reader(source, checkpoint, reader, True)
-        _register_finalizer(bundle_finalizer, checkpoint)
-        yield ProcessContinuation.resume(self.POLL_INTERVAL_SECS)
-        return
-
-      has_data = reader.advance()
+        except Exception:
+          LOG.warning('Failed to close reader in finally block.',
+                      exc_info=True)
 
 
 class ReadFromUnboundedSourceFn(beam.PTransform):
@@ -208,5 +296,11 @@ class ReadFromUnboundedSourceFn(beam.PTransform):
 
       p | beam.Create([my_unbounded_source]) | ReadFromUnboundedSourceFn()
   """
+  def __init__(self, pipeline_options=None):
+    super().__init__()
+    self._pipeline_options = pipeline_options
+
   def expand(self, input_or_inputs):
-    return input_or_inputs | core.ParDo(_SDFUnboundedSourceDoFn())
+    return input_or_inputs | core.ParDo(
+        _SDFUnboundedSourceDoFn(
+            pipeline_options=self._pipeline_options))

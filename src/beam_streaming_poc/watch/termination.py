@@ -145,6 +145,23 @@ class _AllOf(TerminationCondition):
             self._right.can_stop_polling(now, right_state))
 
 
+class _AfterIterations(TerminationCondition):
+  """Terminate after a fixed number of poll iterations."""
+  def __init__(self, n: int):
+    if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+      raise ValueError('n must be a positive integer')
+    self._n = n
+
+  def for_new_input(self, now: Timestamp, input_element: Any):
+    return 0
+
+  def on_poll_complete(self, state: Any) -> Any:
+    return state + 1
+
+  def can_stop_polling(self, now: Timestamp, state: Any) -> bool:
+    return state >= self._n
+
+
 def _duration_to_secs(duration) -> float:
   """Converts a Duration/int/float into seconds."""
   if isinstance(duration, Duration):
@@ -185,3 +202,8 @@ def either_of(c1: TerminationCondition, c2: TerminationCondition):
 def all_of(c1: TerminationCondition, c2: TerminationCondition):
   """Terminate when both conditions are satisfied."""
   return _AllOf(c1, c2)
+
+
+def after_iterations(n: int) -> TerminationCondition:
+  """Terminate after ``n`` poll iterations."""
+  return _AfterIterations(n)

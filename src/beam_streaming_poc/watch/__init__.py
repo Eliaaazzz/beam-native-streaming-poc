@@ -34,6 +34,8 @@ from beam_streaming_poc.watch.termination import after_total_of
 from beam_streaming_poc.watch.termination import after_time_since_new_output
 from beam_streaming_poc.watch.termination import either_of
 from beam_streaming_poc.watch.termination import all_of
+from beam_streaming_poc.watch.termination import after_iterations
+from beam_streaming_poc.watch.growth_fn import DEFAULT_MAX_COMPLETED_SIZE
 from beam_streaming_poc.watch.growth_fn import WatchGrowthFn
 from beam_streaming_poc.watch.growth_fn import Watch
 
@@ -43,6 +45,7 @@ __all__ = [
     'NonPollingGrowthState',
     'PollingGrowthState',
     'EMPTY_STATE',
+    'DEFAULT_MAX_COMPLETED_SIZE',
     'TerminationCondition',
     'WatchGrowthFn',
     'Watch',
@@ -51,4 +54,5 @@ __all__ = [
     'after_time_since_new_output',
     'either_of',
     'all_of',
+    'after_iterations',
 ]

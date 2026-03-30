@@ -39,13 +39,12 @@ from beam_streaming_poc.unbounded_source import NOOP_CHECKPOINT_MARK
 from beam_streaming_poc.unbounded_source import ReadFromUnboundedSourceFn
 from beam_streaming_poc.unbounded_source import UnboundedReader
 from beam_streaming_poc.unbounded_source import UnboundedSource
+from beam_streaming_poc.unbounded_source import ValueWithRecordId
 from beam_streaming_poc.unbounded_source import _SDFUnboundedSourceRestriction
 from beam_streaming_poc.unbounded_source import _SDFUnboundedSourceRestrictionCoder
-from beam_streaming_poc.unbounded_source import _SDFUnboundedSourceRestrictionProvider
 from beam_streaming_poc.unbounded_source import _SDFUnboundedSourceRestrictionTracker
-from beam_streaming_poc.unbounded_source import _SDFUnboundedSourceWatermarkEstimatorProvider
+from beam_streaming_poc.unbounded_source import _SDFUnboundedSourceDoFn
 from beam_streaming_poc.unbounded_source import _put_cached_reader
-from beam_streaming_poc.unbounded_source.wrapper import _SDFUnboundedSourceDoFn
 
 
 # ===================================================================
@@ -247,9 +246,10 @@ class _SplitRecordingSource(UnboundedSource):
     del checkpoint_mark
     raise AssertionError('split-only test source should not create readers')
 
-  def split(self, desired_num_splits=1):
+  def split(self, desired_num_splits=1, pipeline_options=None):
     del desired_num_splits
     self.split_calls += 1
+    self._last_pipeline_options = pipeline_options
     if self._fail_split:
       raise RuntimeError('boom')
     return self._split_result
@@ -306,6 +306,24 @@ class _TerminalWatermarkSource(UnboundedSource):
     return LiveCheckpointMarkCoder()
 
 
+class _ReaderTrackingSource(UnboundedSource):
+  """Like LiveUnboundedSource but tracks the last reader created."""
+  def __init__(self):
+    self._records = []
+    self._last_reader = None
+
+  def add(self, element, timestamp):
+    self._records.append((element, Timestamp(timestamp)))
+
+  def create_reader(self, pipeline_options, checkpoint_mark):
+    start = checkpoint_mark.position if checkpoint_mark else 0
+    self._last_reader = LiveUnboundedReader(self, start)
+    return self._last_reader
+
+  def get_checkpoint_mark_coder(self):
+    return LiveCheckpointMarkCoder()
+
+
 class _CacheOnlyReader(UnboundedReader):
 
   def __init__(self, source, start_position):
@@ -353,10 +371,8 @@ class _CacheOnlySource(UnboundedSource):
   def create_reader(self, pipeline_options, checkpoint_mark):
     self.create_reader_calls.append(
         None if checkpoint_mark is None else checkpoint_mark.position)
-    if checkpoint_mark is not None:
-      raise AssertionError(
-          'Residual should reuse the cached reader instead of recreating it')
-    return _CacheOnlyReader(self, 0)
+    start = checkpoint_mark.position if checkpoint_mark else 0
+    return _CacheOnlyReader(self, start)
 
   def get_checkpoint_mark_coder(self):
     return LiveCheckpointMarkCoder()
@@ -412,7 +428,7 @@ class _FakeBundleFinalizer:
       fn()
 
 
-def _run_process_once(source, restriction=None):
+def _run_process_once(source, restriction=None, pipeline_options=None):
   """Run DoFn.process() once and return (elements, continuation, restriction,
   tracker, estimator, finalizer).
 
@@ -422,8 +438,7 @@ def _run_process_once(source, restriction=None):
   """
   if restriction is None:
     restriction = _SDFUnboundedSourceRestriction(source)
-  dofn = _SDFUnboundedSourceDoFn()
-  dofn.setup()
+  dofn = _SDFUnboundedSourceDoFn(pipeline_options=pipeline_options)
   tracker = _SDFUnboundedSourceRestrictionTracker(restriction)
   tracker_view = _FakeTrackerView(tracker)
   estimator = _FakeWatermarkEstimator()
@@ -707,14 +722,13 @@ class DoFnProcessTest(unittest.TestCase):
     reader, is_started = cached
     self.assertTrue(is_started)
 
-  def test_cached_reader_reused_by_residual_invocation(self):
-    """Residual reuses the cached reader; create_reader is called only once."""
+  def test_residual_creates_new_reader_from_checkpoint(self):
+    """After split, residual creates a new reader from the persisted checkpoint."""
     source = _CacheOnlySource(num_elements=4)
     restriction = _SDFUnboundedSourceRestriction(source)
 
     # First invocation: read element 0, then split.
     dofn = _SDFUnboundedSourceDoFn()
-    dofn.setup()
     tracker = _SDFUnboundedSourceRestrictionTracker(restriction)
     tracker_view = _FakeTrackerView(tracker)
     estimator = _FakeWatermarkEstimator()
@@ -732,16 +746,15 @@ class DoFnProcessTest(unittest.TestCase):
         _, residual = split
         break
 
-    # Let the generator resume once so it can cache the live reader for the
-    # residual invocation.
+    # Let the generator resume so the reader is closed (not cached).
     list(process_iter)
 
-    # Residual invocation: should reuse the reader from cache.
+    # Residual invocation: creates a new reader from checkpoint.
     elements_2, _, _, _, _, _ = _run_process_once(source, residual)
     self.assertEqual(elements_1, [0])
     self.assertEqual(elements_2, [1, 2, 3])
-    # create_reader called only once (original invocation).
-    self.assertEqual(source.create_reader_calls, [None])
+    # create_reader called twice: once for original, once for residual.
+    self.assertEqual(source.create_reader_calls, [None, 1])
 
   def test_no_tight_loop_on_idle_source(self):
     """Idle source process() completes quickly with no busy loop."""
@@ -775,10 +788,14 @@ class DoFnProcessTest(unittest.TestCase):
     cp = cast(LiveCheckpointMark, restriction.checkpoint)
     self.assertIsNotNone(cp)
 
-  def test_setup_initializes_pipeline_options_to_none(self):
+  def test_init_pipeline_options_defaults_to_none(self):
     dofn = _SDFUnboundedSourceDoFn()
-    dofn.setup()
     self.assertIsNone(dofn._pipeline_options)
+
+  def test_init_pipeline_options_stored(self):
+    opts = object()
+    dofn = _SDFUnboundedSourceDoFn(pipeline_options=opts)
+    self.assertIs(dofn._pipeline_options, opts)
 
   def test_resume_from_checkpoint(self):
     """After a checkpoint/resume cycle, the second invocation reads the rest."""
@@ -806,7 +823,7 @@ class DoFnProcessTest(unittest.TestCase):
     """After ProcessContinuation is yielded, tracker try_split sets _stopped."""
     source = LiveUnboundedSource()
     dofn = _SDFUnboundedSourceDoFn()
-    dofn.setup()
+    # __init__ handles setup
     restriction = _SDFUnboundedSourceRestriction(source)
     tracker = _SDFUnboundedSourceRestrictionTracker(restriction)
     tracker_view = _FakeTrackerView(tracker)
@@ -821,7 +838,7 @@ class DoFnProcessTest(unittest.TestCase):
   def test_check_done_passes_after_terminal_watermark(self):
     source = _TerminalWatermarkSource(num_elements=2)
     dofn = _SDFUnboundedSourceDoFn()
-    dofn.setup()
+    # __init__ handles setup
     restriction = _SDFUnboundedSourceRestriction(source)
     tracker = _SDFUnboundedSourceRestrictionTracker(restriction)
     tracker_view = _FakeTrackerView(tracker)
@@ -837,37 +854,32 @@ class DoFnProcessTest(unittest.TestCase):
     # The reader should have been closed.
     self.assertTrue(source._reader._closed)
 
-  def test_reader_not_closed_when_cached_after_split(self):
-    """When a split occurs mid-read, the reader is cached (not closed)."""
-    from beam_streaming_poc.unbounded_source.wrapper import _pop_cached_reader
-    source = LiveUnboundedSource()
+  def test_reader_closed_after_split(self):
+    """When a split occurs mid-read, the reader is closed (not cached).
+
+    Per the proposal, split should close the current reader so the residual
+    rebuilds from the persisted checkpoint.
+    """
+    source = _ReaderTrackingSource()
     for i in range(5):
       source.add(i, i)
 
     dofn = _SDFUnboundedSourceDoFn()
-    dofn.setup()
     restriction = _SDFUnboundedSourceRestriction(source)
     tracker = _SDFUnboundedSourceRestrictionTracker(restriction)
     tracker_view = _FakeTrackerView(tracker)
     estimator = _FakeWatermarkEstimator()
     finalizer = _FakeBundleFinalizer()
 
-    first_reader = None
     for output in dofn.process(source, tracker_view, estimator, finalizer) or []:
-      if isinstance(output, TimestampedValue) and first_reader is None:
-        # After the first element, obtain a reference to the cached reader
-        # by peeking (we'll verify it's alive after split).
-        pass
       if isinstance(output, TimestampedValue) and output.value == 1:
         # Trigger split.
         tracker.try_split(0)
         # After split, try_claim in next loop iteration will return False.
 
-    # Restriction should be done; reader was cached, not closed.
-    cached = _pop_cached_reader(source, restriction.checkpoint)
-    self.assertIsNotNone(cached)
-    reader, _ = cached
-    self.assertFalse(reader._closed)
+    # Reader should have been closed after split (not cached).
+    self.assertIsNotNone(source._last_reader)
+    self.assertTrue(source._last_reader._closed)
 
 
 # ===================================================================
@@ -1067,7 +1079,7 @@ class RestrictionAndCoderTest(unittest.TestCase):
 class RestrictionProviderTest(unittest.TestCase):
 
   def test_provider_builds_restrictions_and_trackers(self):
-    provider = _SDFUnboundedSourceRestrictionProvider()
+    provider = _SDFUnboundedSourceDoFn()
     source = LiveUnboundedSource()
     restriction = provider.initial_restriction(source)
 
@@ -1079,7 +1091,7 @@ class RestrictionProviderTest(unittest.TestCase):
         _SDFUnboundedSourceRestrictionTracker)
 
   def test_provider_split_delegates_to_source_split(self):
-    provider = _SDFUnboundedSourceRestrictionProvider()
+    provider = _SDFUnboundedSourceDoFn()
     source = LiveUnboundedSource()
     restriction = provider.initial_restriction(source)
 
@@ -1088,7 +1100,7 @@ class RestrictionProviderTest(unittest.TestCase):
     self.assertIs(splits[0].source, source)
 
   def test_provider_split_preserves_watermark(self):
-    provider = _SDFUnboundedSourceRestrictionProvider()
+    provider = _SDFUnboundedSourceDoFn()
     child_a = _SplitRecordingSource()
     child_b = _SplitRecordingSource()
     source = _SplitRecordingSource(split_result=[child_a, child_b])
@@ -1103,7 +1115,7 @@ class RestrictionProviderTest(unittest.TestCase):
         [Timestamp(123), Timestamp(123)])
 
   def test_provider_split_keeps_checkpointed_restriction_unsplit(self):
-    provider = _SDFUnboundedSourceRestrictionProvider()
+    provider = _SDFUnboundedSourceDoFn()
     source = _SplitRecordingSource()
     restriction = _SDFUnboundedSourceRestriction(
         source, checkpoint=LiveCheckpointMark(3), watermark=Timestamp(9))
@@ -1114,7 +1126,7 @@ class RestrictionProviderTest(unittest.TestCase):
     self.assertEqual(source.split_calls, 0)
 
   def test_provider_split_falls_back_to_original_restriction_on_error(self):
-    provider = _SDFUnboundedSourceRestrictionProvider()
+    provider = _SDFUnboundedSourceDoFn()
     source = _SplitRecordingSource(fail_split=True)
     restriction = _SDFUnboundedSourceRestriction(source)
 
@@ -1131,7 +1143,7 @@ class RestrictionProviderTest(unittest.TestCase):
 class WatermarkEstimatorProviderTest(unittest.TestCase):
 
   def test_initial_estimator_state_uses_restriction_watermark(self):
-    provider = _SDFUnboundedSourceWatermarkEstimatorProvider()
+    provider = _SDFUnboundedSourceDoFn()
     source = LiveUnboundedSource()
     restriction = _SDFUnboundedSourceRestriction(
         source, watermark=Timestamp(42))
@@ -1140,7 +1152,7 @@ class WatermarkEstimatorProviderTest(unittest.TestCase):
         provider.initial_estimator_state(source, restriction), Timestamp(42))
 
   def test_create_watermark_estimator(self):
-    provider = _SDFUnboundedSourceWatermarkEstimatorProvider()
+    provider = _SDFUnboundedSourceDoFn()
     estimator = provider.create_watermark_estimator(Timestamp(0))
     self.assertIsInstance(estimator, ManualWatermarkEstimator)
 
@@ -1260,6 +1272,207 @@ class RunnerBehaviorProbesTest(unittest.TestCase):
       )
       from apache_beam.testing.util import assert_that, equal_to
       assert_that(output, equal_to([0, 1, 2, 3, 4, 5]))
+
+
+# ===================================================================
+#  Dedup contract tests
+# ===================================================================
+
+class _DedupCheckpointMark(CheckpointMark):
+  def __init__(self, position):
+    self.position = position
+
+
+class _DedupReader(UnboundedReader):
+  def __init__(self, source, start):
+    self._source = source
+    self._position = start
+    self._current = None
+
+  def start(self):
+    return self.advance()
+
+  def advance(self):
+    if self._position >= len(self._source._records):
+      return False
+    self._current = self._source._records[self._position]
+    self._position += 1
+    return True
+
+  def get_current(self):
+    return self._current[0]
+
+  def get_current_timestamp(self):
+    return self._current[1]
+
+  def get_current_record_id(self):
+    return b'record-%d' % self._position
+
+  def get_watermark(self):
+    if self._current is not None:
+      return self._current[1]
+    return Timestamp(0)
+
+  def get_checkpoint_mark(self):
+    return _DedupCheckpointMark(self._position)
+
+
+class _DedupUnboundedSource(UnboundedSource):
+  def __init__(self):
+    self._records = []
+
+  def add(self, element, timestamp):
+    self._records.append((element, Timestamp(timestamp)))
+
+  def requires_deduping(self):
+    return True
+
+  def create_reader(self, pipeline_options, checkpoint_mark):
+    start = checkpoint_mark.position if checkpoint_mark else 0
+    return _DedupReader(self, start)
+
+  def get_checkpoint_mark_coder(self):
+    return coders.registry.get_coder(object)
+
+
+class DedupContractTest(unittest.TestCase):
+
+  def test_requires_deduping_defaults_to_false(self):
+    source = LiveUnboundedSource()
+    self.assertFalse(source.requires_deduping())
+
+  def test_get_current_record_id_raises_by_default(self):
+    reader = LiveUnboundedReader(LiveUnboundedSource(), 0)
+    with self.assertRaises(NotImplementedError):
+      reader.get_current_record_id()
+
+  def test_offset_based_dedup_defaults_to_false(self):
+    reader = LiveUnboundedReader(LiveUnboundedSource(), 0)
+    self.assertFalse(reader.offset_based_deduplication_supported())
+
+  def test_get_total_backlog_bytes_defaults_to_unknown(self):
+    source = LiveUnboundedSource()
+    self.assertEqual(source.get_total_backlog_bytes(), UnboundedReader.BACKLOG_UNKNOWN)
+
+  def test_dedup_source_yields_value_with_record_id(self):
+    source = _DedupUnboundedSource()
+    source.add('a', 1)
+    source.add('b', 2)
+    elements, _, _, _, _, _ = _run_process_once(source)
+    self.assertEqual(len(elements), 2)
+    for elem in elements:
+      self.assertIsInstance(elem, ValueWithRecordId)
+    self.assertEqual(elements[0].value, 'a')
+    self.assertEqual(elements[1].value, 'b')
+    self.assertIsInstance(elements[0].id, bytes)
+
+  def test_non_dedup_source_yields_plain_values(self):
+    source = LiveUnboundedSource()
+    source.add('x', 1)
+    elements, _, _, _, _, _ = _run_process_once(source)
+    self.assertEqual(elements, ['x'])
+    self.assertNotIsInstance(elements[0], ValueWithRecordId)
+
+
+# ===================================================================
+#  Pipeline options propagation tests
+# ===================================================================
+
+class _OptionsRecordingSource(UnboundedSource):
+  """Records pipeline_options passed to split() and create_reader()."""
+  def __init__(self):
+    self._records = []
+    self.split_options = None
+    self.reader_options = None
+
+  def add(self, element, timestamp):
+    self._records.append((element, Timestamp(timestamp)))
+
+  def create_reader(self, pipeline_options, checkpoint_mark):
+    self.reader_options = pipeline_options
+    start = checkpoint_mark.position if checkpoint_mark else 0
+    return LiveUnboundedReader(self, start)
+
+  def split(self, desired_num_splits=1, pipeline_options=None):
+    self.split_options = pipeline_options
+    return [self]
+
+  def get_checkpoint_mark_coder(self):
+    return LiveCheckpointMarkCoder()
+
+
+class PipelineOptionsTest(unittest.TestCase):
+
+  def test_pipeline_options_forwarded_to_create_reader(self):
+    source = _OptionsRecordingSource()
+    source.add('a', 1)
+    opts = object()
+    _run_process_once(source, pipeline_options=opts)
+    self.assertIs(source.reader_options, opts)
+
+  def test_pipeline_options_forwarded_to_split(self):
+    source = _SplitRecordingSource()
+    restriction = _SDFUnboundedSourceRestriction(source)
+    opts = object()
+    dofn = _SDFUnboundedSourceDoFn(pipeline_options=opts)
+    splits = list(dofn.split(source, restriction))
+    self.assertIs(source._last_pipeline_options, opts)
+
+
+# ===================================================================
+#  Exception safety tests
+# ===================================================================
+
+class _ExplodingWatermarkReader(UnboundedReader):
+  """Reader that raises on get_watermark() after first element."""
+  def __init__(self):
+    self._advanced = False
+    self._closed = False
+
+  def start(self):
+    self._advanced = True
+    return True
+
+  def advance(self):
+    return False
+
+  def get_current(self):
+    return 'boom_element'
+
+  def get_checkpoint_mark(self):
+    return NOOP_CHECKPOINT_MARK
+
+  def get_watermark(self):
+    if self._advanced:
+      raise RuntimeError('watermark explosion')
+    return Timestamp(0)
+
+  def close(self):
+    self._closed = True
+
+
+class _ExplodingWatermarkSource(UnboundedSource):
+  def __init__(self):
+    self._reader = None
+
+  def create_reader(self, pipeline_options, checkpoint_mark):
+    self._reader = _ExplodingWatermarkReader()
+    return self._reader
+
+  def get_checkpoint_mark_coder(self):
+    return coders.registry.get_coder(object)
+
+
+class ExceptionSafetyTest(unittest.TestCase):
+
+  def test_reader_closed_when_get_watermark_raises(self):
+    source = _ExplodingWatermarkSource()
+    try:
+      _run_process_once(source)
+    except RuntimeError:
+      pass
+    self.assertIsNotNone(source._reader)
+    self.assertTrue(source._reader._closed)
 
 
 if __name__ == '__main__':

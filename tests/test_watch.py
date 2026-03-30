@@ -38,8 +38,10 @@ from apache_beam.transforms.window import TimestampedValue
 from apache_beam.utils.timestamp import MAX_TIMESTAMP
 from apache_beam.utils.timestamp import Timestamp
 
+from beam_streaming_poc.watch import after_iterations
 from beam_streaming_poc.watch import after_time_since_new_output
 from beam_streaming_poc.watch import after_total_of
+from beam_streaming_poc.watch import DEFAULT_MAX_COMPLETED_SIZE
 from beam_streaming_poc.watch import EMPTY_STATE
 from beam_streaming_poc.watch import GrowthState
 from beam_streaming_poc.watch import NonPollingGrowthState
@@ -804,6 +806,50 @@ class TerminationConditionTest(unittest.TestCase):
     state = condition.on_poll_complete(state)
     self.assertTrue(
         condition.can_stop_polling(Timestamp(seconds=106), state))
+
+
+# ===================================================================
+#  after_iterations tests
+# ===================================================================
+
+class AfterIterationsTest(unittest.TestCase):
+
+  def test_stops_after_n_polls(self):
+    condition = after_iterations(3)
+    state = condition.for_new_input(Timestamp(seconds=0), None)
+    self.assertFalse(condition.can_stop_polling(Timestamp(seconds=0), state))
+    state = condition.on_poll_complete(state)
+    self.assertFalse(condition.can_stop_polling(Timestamp(seconds=0), state))
+    state = condition.on_poll_complete(state)
+    self.assertFalse(condition.can_stop_polling(Timestamp(seconds=0), state))
+    state = condition.on_poll_complete(state)
+    self.assertTrue(condition.can_stop_polling(Timestamp(seconds=0), state))
+
+  def test_rejects_invalid_n(self):
+    with self.assertRaises(ValueError):
+      after_iterations(0)
+    with self.assertRaises(ValueError):
+      after_iterations(-1)
+
+  def test_works_with_either_of(self):
+    from beam_streaming_poc.watch import either_of
+    condition = either_of(after_iterations(2), after_total_of(999))
+    state = condition.for_new_input(Timestamp(seconds=0), None)
+    state = condition.on_poll_complete(state)
+    state = condition.on_poll_complete(state)
+    self.assertTrue(condition.can_stop_polling(Timestamp(seconds=1), state))
+
+
+# ===================================================================
+#  Default max_completed_size test
+# ===================================================================
+
+class DefaultMaxCompletedSizeTest(unittest.TestCase):
+
+  def test_default_is_bounded(self):
+    transform = Watch.growth_of(lambda _: PollResult.empty(complete=True))
+    self.assertEqual(transform._max_completed_size, DEFAULT_MAX_COMPLETED_SIZE)
+    self.assertEqual(DEFAULT_MAX_COMPLETED_SIZE, 100_000)
 
 
 if __name__ == '__main__':

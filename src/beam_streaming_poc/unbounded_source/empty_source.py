@@ -72,7 +72,7 @@ class EmptyUnboundedSource(UnboundedSource):
   def create_reader(self, pipeline_options, checkpoint_mark):
     return _EmptyUnboundedReader()
 
-  def split(self, desired_num_splits=1):
+  def split(self, desired_num_splits=1, pipeline_options=None):
     return [self]
 
   def get_checkpoint_mark_coder(self):

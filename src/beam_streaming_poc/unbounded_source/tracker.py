@@ -15,21 +15,20 @@
 # limitations under the License.
 #
 
-"""RestrictionTracker, RestrictionProvider, and WatermarkEstimatorProvider
-for the UnboundedSource SDF wrapper.
+"""RestrictionTracker for the UnboundedSource SDF wrapper.
+
+The RestrictionProvider and WatermarkEstimatorProvider have been merged
+into ``_SDFUnboundedSourceDoFn`` (in ``wrapper.py``) so that
+``pipeline_options`` is available in ``split()`` and ``create_reader()``.
 """
 
 import logging
 
 from apache_beam.io.iobase import RestrictionProgress
 from apache_beam.io.iobase import RestrictionTracker
-from apache_beam.io.watermark_estimators import ManualWatermarkEstimator
-from apache_beam.transforms import core
 from apache_beam.utils.timestamp import MAX_TIMESTAMP
 
-from beam_streaming_poc.unbounded_source.restriction import NOOP_CHECKPOINT_MARK
 from beam_streaming_poc.unbounded_source.restriction import _SDFUnboundedSourceRestriction
-from beam_streaming_poc.unbounded_source.restriction import _SDFUnboundedSourceRestrictionCoder
 
 LOG = logging.getLogger(__name__)
 
@@ -121,55 +120,3 @@ class _SDFUnboundedSourceRestrictionTracker(RestrictionTracker):
 
   def is_bounded(self):
     return False
-
-
-class _SDFUnboundedSourceWatermarkEstimatorProvider(
-    core.WatermarkEstimatorProvider):
-  """Provides a ``ManualWatermarkEstimator`` seeded from the restriction's
-  persisted watermark."""
-  def initial_estimator_state(self, element, restriction):
-    return restriction.watermark
-
-  def create_watermark_estimator(self, estimator_state):
-    return ManualWatermarkEstimator(estimator_state)
-
-
-class _SDFUnboundedSourceRestrictionProvider(core.RestrictionProvider):
-  """Creates restrictions and trackers for the UnboundedSource SDF wrapper."""
-  def __init__(self, restriction_coder=None):
-    self._restriction_coder = (
-        restriction_coder or _SDFUnboundedSourceRestrictionCoder())
-
-  def initial_restriction(self, element):
-    return _SDFUnboundedSourceRestriction(element, checkpoint=None)
-
-  def split(self, element, restriction):
-    del element
-    if restriction.is_done:
-      return
-
-    checkpoint = restriction.checkpoint
-    if checkpoint is not None and checkpoint is not NOOP_CHECKPOINT_MARK:
-      yield restriction
-      return
-
-    try:
-      sub_sources = restriction.source.split()
-    except Exception:
-      LOG.warning('Failed to split UnboundedSource; using original restriction.',
-                  exc_info=True)
-      yield restriction
-      return
-
-    for sub_source in sub_sources:
-      yield _SDFUnboundedSourceRestriction(
-          sub_source, checkpoint=None, watermark=restriction.watermark)
-
-  def create_tracker(self, restriction):
-    return _SDFUnboundedSourceRestrictionTracker(restriction)
-
-  def restriction_size(self, element, restriction):
-    return 1.0
-
-  def restriction_coder(self):
-    return self._restriction_coder

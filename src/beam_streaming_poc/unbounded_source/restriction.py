@@ -27,6 +27,7 @@ Contains:
 import logging
 import struct
 import time
+from dataclasses import dataclass
 
 from apache_beam import coders
 from apache_beam.internal import pickler
@@ -55,6 +56,13 @@ class CheckpointMark:
 NOOP_CHECKPOINT_MARK = CheckpointMark()
 
 
+@dataclass
+class ValueWithRecordId:
+  """A value paired with a unique record identifier for deduplication."""
+  value: object
+  id: bytes
+
+
 class UnboundedSource(SourceBase):
   """A source that reads an unbounded amount of input.
 
@@ -70,13 +78,30 @@ class UnboundedSource(SourceBase):
     """
     raise NotImplementedError
 
-  def split(self, desired_num_splits=1):
+  def split(self, desired_num_splits=1, pipeline_options=None):
     """Split into sub-sources for parallel reading. Default: ``[self]``."""
     return [self]
 
   def get_checkpoint_mark_coder(self):
     """Return a ``Coder`` for the ``CheckpointMark`` type."""
     raise NotImplementedError
+
+  def requires_deduping(self):
+    """Whether this source requires record-level deduplication.
+
+    When ``True``, the SDF wrapper emits ``ValueWithRecordId`` elements
+    using ``reader.get_current_record_id()`` so that downstream dedup
+    transforms can identify and discard duplicate records after
+    checkpoint/restore.
+    """
+    return False
+
+  def get_total_backlog_bytes(self):
+    """Total backlog across all splits, if known.
+
+    Returns ``UnboundedReader.BACKLOG_UNKNOWN`` (``-1``) by default.
+    """
+    return UnboundedReader.BACKLOG_UNKNOWN
 
   def is_bounded(self):
     return False
@@ -123,6 +148,28 @@ class UnboundedReader:
   def get_split_backlog_bytes(self):
     """Return the remaining backlog in bytes, if known."""
     return self.BACKLOG_UNKNOWN
+
+  def get_current_record_id(self):
+    """Return a unique record ID (bytes) for the current element.
+
+    Required when ``source.requires_deduping()`` is ``True``.  The ID
+    must be stable across checkpoint/restore for the same logical record.
+    """
+    raise NotImplementedError(
+        'get_current_record_id() must be implemented when '
+        'requires_deduping() is True')
+
+  def offset_based_deduplication_supported(self):
+    """Whether offset-based deduplication is supported. Default: ``False``."""
+    return False
+
+  def get_current_record_offset(self):
+    """Return the current record offset for offset-based dedup."""
+    raise NotImplementedError
+
+  def get_offset_limit(self):
+    """Return the offset limit for offset-based dedup."""
+    raise NotImplementedError
 
   def close(self):
     """Release resources held by this reader."""
